@@ -1,0 +1,112 @@
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+#define DEVICE_NAME   "AutoBLE"
+#define SERVICE_UUID  "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHAR_UUID     "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+
+// ---- Pines (evitamos GPIO 2, 8 y 9 por ser de arranque/LED/boton) ----
+const int PIN_IN1   = 3;   // L298N IN1
+const int PIN_IN2   = 4;   // L298N IN2
+const int PIN_ENA   = 5;   // L298N ENA (PWM de velocidad)
+const int PIN_SERVO = 6;   // Senal del servo
+
+const int SERVO_CENTRO = 90;
+
+// Canales PWM separados (timers distintos: canal 0 -> timer 0, canal 2 -> timer 1)
+const int CH_MOTOR = 0;   // 1 kHz, 8 bits
+const int CH_SERVO = 2;   // 50 Hz, 14 bits
+bool conectado = false;
+
+void setMotor(int v) {
+  v = constrain(v, -255, 255);
+  if (v > 0) {
+    digitalWrite(PIN_IN1, HIGH);
+    digitalWrite(PIN_IN2, LOW);
+  } else if (v < 0) {
+    digitalWrite(PIN_IN1, LOW);
+    digitalWrite(PIN_IN2, HIGH);
+  } else {
+    digitalWrite(PIN_IN1, LOW);
+    digitalWrite(PIN_IN2, LOW);
+  }
+  ledcWrite(PIN_ENA, abs(v));   // core 3.x: se escribe por pin
+}
+
+void setDireccion(int angulo) {
+  angulo = constrain(angulo, 0, 180);
+  // 50 Hz y 14 bits: periodo 20 ms = 16384 cuentas. 0.5 ms ~ 410, 2.4 ms ~ 1966
+  int duty = map(angulo, 0, 180, 410, 1966);
+  ledcWrite(PIN_SERVO, duty);
+}
+
+void frenar() {
+  setMotor(0);
+  setDireccion(SERVO_CENTRO);
+}
+
+class ServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *s) override {
+    conectado = true;
+    Serial.println("Cliente conectado");
+  }
+  void onDisconnect(BLEServer *s) override {
+    conectado = false;
+    Serial.println("Cliente desconectado");
+    frenar();                       // seguridad: si se corta, el auto para
+    BLEDevice::startAdvertising();  // volver a quedar visible
+  }
+};
+
+class CharCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *c) override {
+    String cmd = String(c->getValue().c_str());
+    cmd.trim();
+    if (cmd.length() == 0) return;
+
+    char tipo = cmd.charAt(0);
+    int valor = cmd.substring(1).toInt();
+
+    switch (tipo) {
+      case 'M': setMotor(valor);     break;
+      case 'S': setDireccion(valor); break;
+      case 'X': frenar();            break;
+      default:  Serial.println("Comando desconocido: " + cmd);
+    }
+  }
+};
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PIN_IN1, OUTPUT);
+  pinMode(PIN_IN2, OUTPUT);
+  ledcAttachChannel(PIN_ENA, 1000, 8, CH_MOTOR);    // motor: 1 kHz, 8 bits (0-255)
+  ledcAttachChannel(PIN_SERVO, 50, 14, CH_SERVO);   // servo: 50 Hz, 14 bits
+  frenar();
+
+  BLEDevice::init(DEVICE_NAME);
+  BLEServer *server = BLEDevice::createServer();
+  server->setCallbacks(new ServerCallbacks());
+
+  BLEService *service = server->createService(SERVICE_UUID);
+  BLECharacteristic *ch = service->createCharacteristic(
+    CHAR_UUID,
+    BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR
+  );
+  ch->setCallbacks(new CharCallbacks());
+  service->start();
+
+  BLEAdvertising *adv = BLEDevice::getAdvertising();
+  adv->addServiceUUID(SERVICE_UUID);
+  adv->setScanResponse(true);
+  BLEDevice::startAdvertising();
+
+  Serial.println("Listo, buscando como: " DEVICE_NAME);
+}
+
+void loop() {
+  delay(50);
+}
